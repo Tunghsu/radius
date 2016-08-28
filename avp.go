@@ -3,189 +3,417 @@ package radius
 import (
 	"bytes"
 	"crypto"
+	_ "crypto/md5"
 	"encoding/binary"
-	"errors"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"reflect"
 	"strconv"
+
+	"github.com/Tunghsu/radius/eap"
 )
 
-type AVP struct {
-	Type  AttributeType
+type AVP interface {
+	GetType() AVPType
+	Encode() (b []byte, err error)
+	Copy() AVP
+
+	String() string
+	GetValue() interface{}
+	ValueAsString() string
+}
+
+func avpDecode(p *Packet, b []byte) (avp AVP, err error) {
+	if len(b) < 2 {
+		return nil, fmt.Errorf("[avp.Decode] protocol error 1 buffer too small")
+	}
+	typ := AVPType(b[0])
+	data := b[2:]
+	decoder := getTypeDesc(typ).decoder
+	return decoder(p, typ, data)
+}
+
+func encodeWithByteSlice(typ AVPType, data []byte) (b []byte, err error) {
+	if len(data) > 253 {
+		return nil, fmt.Errorf("[encodeWithByteSlice] data length %d overflow(should less than 253)", len(data))
+	}
+	length := len(data) + 2
+	b = make([]byte, length)
+	b[0] = byte(typ)
+	b[1] = byte(length)
+	copy(b[2:], data)
+	return b, nil
+}
+func avpBinary(p *Packet, typ AVPType, data []byte) (avp AVP, err error) {
+	return &BinaryAVP{
+		Type:  typ,
+		Value: data,
+	}, nil
+}
+
+type BinaryAVP struct {
+	Type  AVPType
 	Value []byte
 }
 
-func (a AVP) Copy() AVP {
-	value := make([]byte, len(a.Value))
-	copy(value, a.Value)
-	return AVP{
+func (a *BinaryAVP) GetType() AVPType {
+	return a.Type
+}
+func (a *BinaryAVP) String() string {
+	return fmt.Sprintf("Type: %s Value: %#v", a.Type, a.Value)
+}
+func (a *BinaryAVP) Encode() (b []byte, err error) {
+	if len(a.Value) > 253 {
+		return nil, fmt.Errorf("[BinaryAVP.Encode] len(a.Value)[%d]>253", len(a.Value))
+	}
+	return encodeWithByteSlice(a.Type, a.Value)
+}
+func (a *BinaryAVP) Copy() AVP {
+	return &BinaryAVP{
+		Type:  a.Type,
+		Value: append([]byte(nil), a.Value...),
+	}
+}
+func (a *BinaryAVP) GetValue() interface{} {
+	return a.Value
+}
+func (a *BinaryAVP) ValueAsString() string {
+	return hex.EncodeToString(a.Value)
+}
+
+func avpString(p *Packet, typ AVPType, data []byte) (avp AVP, err error) {
+	return &StringAVP{
+		Type:  typ,
+		Value: string(data),
+	}, nil
+}
+
+type StringAVP struct {
+	Type  AVPType
+	Value string
+}
+
+func (a *StringAVP) GetType() AVPType {
+	return a.Type
+}
+func (a *StringAVP) String() string {
+	return fmt.Sprintf("Type: %s Value: %s", a.Type, a.Value)
+}
+func (a *StringAVP) Encode() (b []byte, err error) {
+	if len(a.Value) > 253 {
+		return nil, fmt.Errorf("[StringAVP.Encode] len(a.Value)[%d]>253", len(a.Value))
+	}
+	return encodeWithByteSlice(a.Type, []byte(a.Value))
+}
+func (a *StringAVP) Copy() AVP {
+	return &StringAVP{
 		Type:  a.Type,
 		Value: a.Value,
 	}
 }
-func (a AVP) Encode(b []byte) (n int, err error) {
-	fullLen := len(a.Value) + 2 //type and length
-	if fullLen > 255 || fullLen < 2 {
-		return 0, errors.New("value too big for attribute")
-	}
-	b[0] = uint8(a.Type)
-	b[1] = uint8(fullLen)
-	copy(b[2:], a.Value)
-	return fullLen, err
-}
-
-func (a AVP) Decode(p *Packet) interface{} {
-	return getAttributeTypeDesc(a.Type).dataType.Value(p, a)
-}
-
-func (a AVP) String() string {
-	return "AVP type: " + a.Type.String() + " " + getAttributeTypeDesc(a.Type).dataType.String(nil, a)
-}
-
-func (a AVP) StringWithPacket(p *Packet) string {
-	return "AVP type: " + a.Type.String() + " " + getAttributeTypeDesc(a.Type).dataType.String(p, a)
-}
-
-type avpDataType interface {
-	Value(p *Packet, a AVP) interface{}
-	String(p *Packet, a AVP) string
-}
-
-var avpString avpStringt
-
-type avpStringt struct{}
-
-func (s avpStringt) Value(p *Packet, a AVP) interface{} {
-	return string(a.Value)
-}
-func (s avpStringt) String(p *Packet, a AVP) string {
-	return string(a.Value)
-}
-
-var avpIP avpIPt
-
-type avpIPt struct{}
-
-func (s avpIPt) Value(p *Packet, a AVP) interface{} {
-	return net.IP(a.Value)
-}
-func (s avpIPt) String(p *Packet, a AVP) string {
-	return net.IP(a.Value).String()
-}
-
-var avpUint32 avpUint32t
-
-type avpUint32t struct{}
-
-func (s avpUint32t) Value(p *Packet, a AVP) interface{} {
-	return uint32(binary.BigEndian.Uint32(a.Value))
-}
-func (s avpUint32t) String(p *Packet, a AVP) string {
-	return strconv.Itoa(int(binary.BigEndian.Uint32(a.Value)))
-}
-
-var avpBinary avpBinaryt
-
-type avpBinaryt struct{}
-
-func (s avpBinaryt) Value(p *Packet, a AVP) interface{} {
+func (a *StringAVP) GetValue() interface{} {
 	return a.Value
 }
-func (s avpBinaryt) String(p *Packet, a AVP) string {
-	return fmt.Sprintf("%#v", a.Value)
+
+func (a *StringAVP) ValueAsString() string {
+	return a.Value
 }
 
-var avpPassword avpPasswordt
+func avpIP(p *Packet, typ AVPType, data []byte) (avp AVP, err error) {
+	return &IpAVP{
+		Type:  typ,
+		Value: net.IP(data),
+	}, nil
+}
 
-type avpPasswordt struct{}
+type IpAVP struct {
+	Type  AVPType
+	Value net.IP
+}
 
-func (s avpPasswordt) Value(p *Packet, a AVP) interface{} {
-	if p == nil {
-		return ""
+func (a *IpAVP) GetType() AVPType {
+	return a.Type
+}
+func (a *IpAVP) String() string {
+	return fmt.Sprintf("Type: %s Value: %s", a.Type, a.Value)
+}
+func (a *IpAVP) Encode() (b []byte, err error) {
+	return encodeWithByteSlice(a.Type, []byte(a.Value))
+}
+func (a *IpAVP) Copy() AVP {
+	return &IpAVP{
+		Type:  a.Type,
+		Value: net.IP(append([]byte(nil), []byte(a.Value)...)),
 	}
+}
+func (a *IpAVP) GetValue() interface{} {
+	return a.Value
+}
+func (a *IpAVP) ValueAsString() string {
+	return a.Value.String()
+}
 
-	buff := a.Value
-	pass := make([]byte, 0)
-	last := make([]byte, 16)
-	copy(last, p.Authenticator[:])
+func avpUint32(p *Packet, typ AVPType, data []byte) (avp AVP, err error) {
+	if len(data) != 4 {
+		return nil, fmt.Errorf("[avpUint32] len(data)[%d]!=4", len(data))
+	}
+	return &Uint32AVP{
+		Type:  typ,
+		Value: uint32(binary.BigEndian.Uint32(data)),
+	}, nil
+}
 
-	for len(buff) > 0 {
-		m := crypto.Hash(crypto.MD5).New()
-		m.Write(append([]byte(p.Secret), last...))
-		h := m.Sum(nil)
-		for i := 0; i < 16; i++ {
-			pass = append(pass, buff[i]^h[i])
+type Uint32AVP struct {
+	Type  AVPType
+	Value uint32
+}
+
+func (a *Uint32AVP) GetType() AVPType {
+	return a.Type
+}
+func (a *Uint32AVP) String() string {
+	return fmt.Sprintf("Type: %s Value: %d", a.Type, a.Value)
+}
+func (a *Uint32AVP) Encode() (b []byte, err error) {
+	data := make([]byte, 4)
+	binary.BigEndian.PutUint32(data, a.Value)
+	return encodeWithByteSlice(a.Type, data)
+}
+func (a *Uint32AVP) Copy() AVP {
+	return &Uint32AVP{
+		Type:  a.Type,
+		Value: a.Value,
+	}
+}
+func (a *Uint32AVP) GetValue() interface{} {
+	return a.Value
+}
+func (a *Uint32AVP) ValueAsString() string {
+	return strconv.Itoa(int(a.Value))
+}
+
+func avpPassword(p *Packet, typ AVPType, data []byte) (avp AVP, err error) {
+	fmt.Printf("%#v\n", data)
+	if len(data) < 16 {
+		return nil, fmt.Errorf("[avpPassword] len(data)[%d]<16", len(data))
+	}
+	if len(data) > 128 {
+		return nil, fmt.Errorf("[avpPassword] len(data)[%d]>128", len(data))
+	}
+	//Decode password. XOR against md5(p.server.secret+Authenticator)
+	m := crypto.Hash(crypto.MD5).New()
+	m.Write(p.Secret)
+	m.Write(p.Authenticator[:])
+	md := m.Sum(nil)
+	pass := append([]byte(nil), data...)
+	blockNum := len(pass) / 16
+	if len(pass)%16 != 0 {
+		return nil, fmt.Errorf("[avpPassword] blockNum[%d]%%16!=0", blockNum)
+	}
+	outputPass := make([]byte, len(pass))
+	for i := 0; i < blockNum; i++ {
+		for j := 0; j < 16; j++ {
+			outputPass[i*16+j] = pass[i*16+j] ^ md[j]
 		}
-		last = buff[:16]
-		buff = buff[16:]
+		m := crypto.Hash(crypto.MD5).New()
+		m.Write(p.Secret)
+		m.Write(pass[i*16 : i*16+16])
+		md = m.Sum(nil)
 	}
-
-	pass = bytes.TrimRight(pass, string([]rune{0}))
-	return string(pass)
-}
-func (s avpPasswordt) String(p *Packet, a AVP) string {
-	return s.Value(p, a).(string)
-}
-
-type avpUint32EnumList []string
-
-func (s avpUint32EnumList) Value(p *Packet, a AVP) interface{} {
-	return uint32(binary.BigEndian.Uint32(a.Value))
-}
-func (s avpUint32EnumList) String(p *Packet, a AVP) string {
-	number := int(binary.BigEndian.Uint32(a.Value))
-	if number > len(s) {
-		return "unknow " + strconv.Itoa(number)
+	outputPass = bytes.TrimRight(outputPass, string([]rune{0}))
+	avpP := &PasswordAVP{
+		Value: string(outputPass),
 	}
-	out := s[number]
-	if out == "" {
-		return "unknow " + strconv.Itoa(number)
+	avpP.SetPacket(p)
+	return avpP, nil
+}
+
+type PasswordAVP struct {
+	packet *Packet
+	Value  string // plain of password
+}
+
+func (a *PasswordAVP) GetType() AVPType {
+	return AVPTypeUserPassword
+}
+func (a *PasswordAVP) String() string {
+	return fmt.Sprintf("Type: %s Value: %s", a.GetType(), a.Value)
+}
+func (a *PasswordAVP) SetPacket(p *Packet) {
+	a.packet = p
+}
+func (a *PasswordAVP) Copy() AVP {
+	return &PasswordAVP{
+		packet: a.packet,
+		Value:  a.Value,
 	}
-	return out
+}
+func (a *PasswordAVP) GetValue() interface{} {
+	return a.Value
 }
 
-type avpUint32Enum struct {
-	t interface{} // t should from a uint32 type like AcctStatusTypeEnum
+func (a *PasswordAVP) ValueAsString() string {
+	return a.Value
 }
 
-func (s avpUint32Enum) Value(p *Packet, a AVP) interface{} {
-	value := reflect.New(reflect.TypeOf(s.t)).Elem()
-	value.SetUint(uint64(binary.BigEndian.Uint32(a.Value)))
-	return value.Interface()
-}
-func (s avpUint32Enum) String(p *Packet, a AVP) string {
-	number := binary.BigEndian.Uint32(a.Value)
-	value := reflect.New(reflect.TypeOf(s.t)).Elem()
-	value.SetUint(uint64(number))
-	method := value.MethodByName("String")
-	if !method.IsValid() {
-		return strconv.Itoa(int(number))
+//you need set packet before encode
+func (a *PasswordAVP) Encode() (b []byte, err error) {
+	m := crypto.Hash(crypto.MD5).New()
+	m.Write(a.packet.Secret)
+	m.Write(a.packet.Authenticator[:])
+	md := m.Sum(nil)
+	if len(a.Value) > 128 {
+		return nil, fmt.Errorf("[PasswordAVP.Encode] len(data)[%d]>128", len(a.Value))
 	}
-	out := method.Call(nil)
-	return out[0].Interface().(string)
+	inPassLen := len(a.Value) / 16 * 16
+	if len(a.Value)%16 != 0 {
+		inPassLen += 16
+	}
+	pass := make([]byte, inPassLen)
+	outPass := make([]byte, inPassLen)
+	copy(pass, a.Value)
+	blockNum := inPassLen / 16
+	for i := 0; i < blockNum; i++ {
+		for j := 0; j < 16; j++ {
+			outPass[i*16+j] = pass[i*16+j] ^ md[j]
+		}
+		m := crypto.Hash(crypto.MD5).New()
+		m.Write(a.packet.Secret)
+		m.Write(outPass[i*16 : i*16+16])
+		md = m.Sum(nil)
+	}
+	return encodeWithByteSlice(AVPTypeUserPassword, outPass)
 }
 
-var avpEapMessage avpEapMessaget
+// t should from a uint32 type like AcctStatusTypeEnum
+func avpUint32Enum(t Stringer) func(p *Packet, typ AVPType, data []byte) (avp AVP, err error) {
+	return func(p *Packet, typ AVPType, data []byte) (avp AVP, err error) {
+		value := reflect.New(reflect.TypeOf(t)).Elem()
+		value.SetUint(uint64(binary.BigEndian.Uint32(data)))
+		valueI := value.Interface().(Stringer)
+		return &Uint32EnumAVP{
+			Type:  typ,
+			Value: valueI,
+		}, nil
+	}
+}
 
-type avpEapMessaget struct{}
+type Uint32EnumAVP struct {
+	Type  AVPType
+	Value Stringer // value should derive from a uint32 type like AcctStatusTypeEnum
+}
 
-func (s avpEapMessaget) Value(p *Packet, a AVP) interface{} {
-	eap, err := EapDecode(a.Value)
+func (a *Uint32EnumAVP) GetType() AVPType {
+	return a.Type
+}
+func (a *Uint32EnumAVP) String() string {
+	return fmt.Sprintf("Type: %s Value: %s", a.GetType(), a.Value)
+}
+func (a *Uint32EnumAVP) Encode() (b []byte, err error) {
+	b = make([]byte, 4)
+	value := reflect.ValueOf(a.Value)
+	out := value.Uint()
+	if out >= (1 << 32) {
+		panic("[Uint32EnumAVP.Encode] enum number overflow")
+	}
+	binary.BigEndian.PutUint32(b, uint32(out))
+	return encodeWithByteSlice(a.Type, b)
+}
+func (a *Uint32EnumAVP) Copy() AVP {
+	return &Uint32EnumAVP{
+		Type:  a.Type,
+		Value: a.Value,
+	}
+}
+func (a *Uint32EnumAVP) GetValue() interface{} {
+	return a.Value
+}
+func (a *Uint32EnumAVP) ValueAsString() string {
+	return a.Value.String()
+}
+
+func avpEapMessage(p *Packet, typ AVPType, data []byte) (avp AVP, err error) {
+	eap, err := eap.Decode(data)
 	if err != nil {
-		//TODO error handle
-		fmt.Println("EapDecode fail ", err)
-		return nil
+		return nil, err
 	}
-	return eap
-
+	return &EapAVP{
+		Value: eap,
+	}, nil
 }
-func (s avpEapMessaget) String(p *Packet, a AVP) string {
-	eap := s.Value(p, a)
-	if eap == nil {
-		return "nil"
+
+type EapAVP struct {
+	Value eap.Packet
+}
+
+func (a *EapAVP) GetType() AVPType {
+	return AVPTypeEAPMessage
+}
+func (a *EapAVP) String() string {
+	return fmt.Sprintf("Type: %s Value: %s", a.GetType(), a.Value.String())
+}
+func (a *EapAVP) Encode() (b []byte, err error) {
+	b = a.Value.Encode()
+	return encodeWithByteSlice(AVPTypeEAPMessage, b)
+}
+
+//TODO real copy
+func (a *EapAVP) Copy() AVP {
+	return &EapAVP{
+		Value: a.Value,
 	}
-	return eap.(*EapPacket).String()
+}
+func (a *EapAVP) GetValue() interface{} {
+	return a.Value
+}
+func (a *EapAVP) ValueAsString() string {
+	return a.Value.String()
+}
+
+func avpVendorSpecific(p *Packet, typ AVPType, data []byte) (avp AVP, err error) {
+	vsa, err := vsaDecode(p, data)
+	if err != nil {
+		return nil, err
+	}
+	return &VendorSpecificAVP{
+		Value: vsa,
+	}, nil
+}
+
+type VendorSpecificAVP struct {
+	Value VSA
+}
+
+func (a *VendorSpecificAVP) GetType() AVPType {
+	return AVPTypeVendorSpecific
+}
+func (a *VendorSpecificAVP) String() string {
+	return fmt.Sprintf("Type: %s Value: %s", a.GetType(), a.Value.String())
+}
+func (a *VendorSpecificAVP) Encode() (b []byte, err error) {
+	b, err = a.Value.Encode()
+	if err != nil {
+		return nil, err
+	}
+	return encodeWithByteSlice(AVPTypeVendorSpecific, b)
+}
+
+//TODO real copy
+func (a *VendorSpecificAVP) Copy() AVP {
+	return &VendorSpecificAVP{
+		Value: a.Value,
+	}
+}
+func (a *VendorSpecificAVP) GetValue() interface{} {
+	return a.Value
+}
+func (a *VendorSpecificAVP) ValueAsString() string {
+	return a.Value.String()
+}
+
+type Stringer interface {
+	String() string
 }
 
 type AcctStatusTypeEnum uint32
